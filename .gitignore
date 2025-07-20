@@ -1,0 +1,14 @@
+# Ignore virtual env
+.venv/
+venv/
+
+# Ignore env vars file
+.env
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# IDE files
+.vscode/
+*.suo
