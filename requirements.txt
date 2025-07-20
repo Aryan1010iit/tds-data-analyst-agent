@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+openai
+pandas
+duckdb
+httpx
+beautifulsoup4
+matplotlib
+python-dotenv
