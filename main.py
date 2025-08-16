@@ -1,30 +1,31 @@
 # main.py
 import os, re, io, base64, math, time
 from typing import Optional, Dict, Any, List, Tuple
+
 import numpy as np
 import pandas as pd
+
 import matplotlib
 matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 
-# Keep your helpers if present
+# Use your existing helpers
 try:
-    from utils.scraper import fetch_wikipedia_table
-    from utils.plotting import make_scatterplot  # dotted red regression line
+    from utils.analysis import make_scatterplot, fetch_wikipedia_table
 except Exception:
-    fetch_wikipedia_table = None
     make_scatterplot = None
+    fetch_wikipedia_table = None
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
-# -------- Timing watchdog --------
-MAX_SECONDS = 290  # < 5 min
+# ---------------- Timing watchdog ----------------
+MAX_SECONDS = 290  # < 5 minutes per request
 def time_left(start: float) -> float:
     return MAX_SECONDS - (time.time() - start)
 
-# -------- Small helpers --------
+# ---------------- Small helpers ----------------
 def _decode(b: bytes) -> str:
     return b.decode("utf-8", errors="ignore").strip()
 
@@ -46,7 +47,29 @@ def _png_data_uri(fig, max_kb: int = 100) -> str:
     plt.close(fig)
     return _tiny_png_uri()
 
-# --- Charts (colors only when explicitly requested in tasks) ---
+# ---- JSON-safe number normalizer (no NaN/Inf; limited precision) ----
+def jnum(x, nd: int = 6) -> float:
+    try:
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return 0.0
+        return float(round(v, nd))
+    except Exception:
+        return 0.0
+
+# ---- If multiple CSVs are attached, prefer the one mentioned in the prompt ----
+def choose_csv(files: List[Tuple[str, bytes]], text: str) -> bytes:
+    if not files:
+        return b""
+    if len(files) == 1:
+        return files[0][1]
+    low = (text or "").lower()
+    for name, data in files:
+        if name and name.lower() in low:
+            return data
+    return files[0][1]
+
+# ---------------- Charts (colors only when explicitly requested) ----------------
 def _bar_chart_region_totals(region_totals: pd.Series) -> str:
     fig, ax = plt.subplots(figsize=(4.2, 3.0))
     ax.bar(region_totals.index.astype(str), region_totals.values, color="blue")  # spec: blue
@@ -58,7 +81,8 @@ def _line_chart_cumulative(dates: pd.Series, cum_sales: pd.Series) -> str:
     fig, ax = plt.subplots(figsize=(4.6, 3.0))
     ax.plot(dates, cum_sales, color="red")  # spec: red
     ax.set_xlabel("Date"); ax.set_ylabel("Cumulative Sales"); ax.set_title("Cumulative Sales Over Time")
-    for lbl in ax.get_xticklabels(): lbl.set_rotation(45); lbl.set_ha("right")
+    for lbl in ax.get_xticklabels():
+        lbl.set_rotation(45); lbl.set_ha("right")
     fig.tight_layout()
     return _png_data_uri(fig, 100)
 
@@ -66,7 +90,8 @@ def _weather_temp_line(dates: pd.Series, temps: pd.Series) -> str:
     fig, ax = plt.subplots(figsize=(4.6, 3.0))
     ax.plot(dates, temps, color="red")  # spec: red
     ax.set_xlabel("Date"); ax.set_ylabel("Temperature (°C)"); ax.set_title("Temperature Over Time")
-    for lbl in ax.get_xticklabels(): lbl.set_rotation(45); lbl.set_ha("right")
+    for lbl in ax.get_xticklabels():
+        lbl.set_rotation(45); lbl.set_ha("right")
     fig.tight_layout()
     return _png_data_uri(fig, 100)
 
@@ -77,7 +102,7 @@ def _weather_precip_hist(precip: pd.Series) -> str:
     fig.tight_layout()
     return _png_data_uri(fig, 100)
 
-# --- Simple undirected graph utilities (no networkx) ---
+# ---------------- Simple undirected graph utilities (no networkx) ----------------
 def _build_undirected_graph(edges: List[Tuple[str, str]]):
     undirected = set()
     nodes = set()
@@ -94,53 +119,67 @@ def _build_undirected_graph(edges: List[Tuple[str, str]]):
 
 def _shortest_path_length(adj: Dict[str, set], src: str, dst: str) -> Optional[int]:
     src = src.strip(); dst = dst.strip()
-    if src not in adj or dst not in adj: return None
-    if src == dst: return 0
+    if src not in adj or dst not in adj:
+        return None
+    if src == dst:
+        return 0
     from collections import deque
-    q = deque([(src, 0)]); seen = {src}
+    q = deque([(src, 0)])
+    seen = {src}
     while q:
         node, d = q.popleft()
         for nb in adj[node]:
-            if nb == dst: return d + 1
+            if nb == dst:
+                return d + 1
             if nb not in seen:
-                seen.add(nb); q.append((nb, d + 1))
+                seen.add(nb)
+                q.append((nb, d + 1))
     return None
 
 def _network_graph_image(nodes: List[str], undirected_edges: List[Tuple[str, str]]) -> str:
     n = len(nodes)
     angle = np.linspace(0, 2*np.pi, n, endpoint=False) if n else np.array([])
     pos = {nodes[i]: (math.cos(angle[i]), math.sin(angle[i])) for i in range(n)}
+
     fig, ax = plt.subplots(figsize=(4.2, 4.2))
+    # edges
     for u, v in undirected_edges:
-        x = [pos[u][0], pos[v][0]]; y = [pos[u][1], pos[v][1]]
+        x = [pos[u][0], pos[v][0]]
+        y = [pos[u][1], pos[v][1]]
         ax.plot(x, y, color="gray", linewidth=1)
-    xs = [pos[nm][0] for nm in nodes]; ys = [pos[nm][1] for nm in nodes]
+    # nodes
+    xs = [pos[nm][0] for nm in nodes]
+    ys = [pos[nm][1] for nm in nodes]
     ax.scatter(xs, ys, s=120)
+    # labels
     for nm in nodes:
         ax.text(pos[nm][0], pos[nm][1], nm, fontsize=9, ha="center", va="center", color="white")
-    ax.set_aspect("equal"); ax.axis("off"); ax.set_title("Network")
+    ax.set_aspect("equal"); ax.axis("off")
+    ax.set_title("Network")
     fig.tight_layout()
     return _png_data_uri(fig, 100)
 
 def _degree_histogram_image(degrees: Dict[str, int]) -> str:
     from collections import Counter
     counts = Counter(degrees.values())
-    xs = sorted(counts.keys()); ys = [counts[x] for x in xs]
+    xs = sorted(counts.keys())
+    ys = [counts[x] for x in xs]
     fig, ax = plt.subplots(figsize=(4.2, 3.0))
     ax.bar([str(x) for x in xs], ys, color="green")  # spec: green
-    ax.set_xlabel("Degree"); ax.set_ylabel("Count"); ax.set_title("Degree Distribution")
+    ax.set_xlabel("Degree"); ax.set_ylabel("Count")
+    ax.set_title("Degree Distribution")
     fig.tight_layout()
     return _png_data_uri(fig, 100)
 
-# -------- Spec parser + minimal response --------
+# ---------------- Spec parser + minimal response ----------------
 KEY_LINE = re.compile(r"^\s*[-*•]\s*`?([^`:`]+?)`?\s*(?::\s*([A-Za-z ]+))?\s*$")
 
 def parse_declared_keys_from_text(text: str) -> Dict[str, Any]:
     """
-    Looks for:
-      Return a JSON object with keys:
+    Detects:
+      'Return a JSON object with keys:' followed by bullets like:
         - `key`: type
-    Or mentions 'JSON array'
+    Or 'JSON array' (then we return []).
     """
     spec: Dict[str, Any] = {"type": "unknown", "keys": []}
     if not text:
@@ -151,7 +190,7 @@ def parse_declared_keys_from_text(text: str) -> Dict[str, Any]:
         spec["type"] = "array"
         return spec
 
-    # Find the "Return a JSON object with keys:" section
+    # Find the section start
     start = None
     for i, ln in enumerate(lines):
         if re.search(r"return\s+a\s+json\s+object\s+with\s+keys", ln, re.I):
@@ -164,9 +203,10 @@ def parse_declared_keys_from_text(text: str) -> Dict[str, Any]:
     for j in range(start, len(lines)):
         m = KEY_LINE.match(lines[j])
         if not m:
-            # stop at first non-bullet after starting
-            if keys: break
-            else: continue
+            if keys:
+                break
+            else:
+                continue
         key = m.group(1).strip()
         typ = (m.group(2) or "").strip().lower() or None
         keys.append((key, typ))
@@ -176,14 +216,13 @@ def parse_declared_keys_from_text(text: str) -> Dict[str, Any]:
     return spec
 
 def minimal_valid_response(spec: Dict[str, Any]) -> Any:
-    """Return a minimal valid structure with the declared keys."""
+    """Return a minimal valid structure with declared keys (or safe array fallback)."""
     if spec.get("type") == "array":
-        # Default array structure if asked
         return []
 
     keys = spec.get("keys") or []
     if not keys:
-        # Default 4-item array fallback (keeps compatibility with Wikipedia sample)
+        # Default 4-item array fallback (compatible with the Wikipedia sample)
         return ["unsupported", "", 0.0, _tiny_png_uri()]
 
     out: Dict[str, Any] = {}
@@ -196,32 +235,23 @@ def minimal_valid_response(spec: Dict[str, Any]) -> Any:
         elif typ and ("number" in typ or "float" in typ or "int" in typ):
             out[key] = 0.0
         else:
-            # guess by name
             if any(t in kl for t in ["count","total","sum","mean","avg","median","slope","correlation","density","degree","length","tax","min","max"]):
                 out[key] = 0.0
             else:
                 out[key] = ""
     return out
 
-def coerce_number(x: Any) -> float:
-    try:
-        if x is None: return 0.0
-        if isinstance(x, (np.floating, np.integer)): return float(x)
-        return float(x)
-    except Exception:
-        return 0.0
-
-# -------- Health --------
+# ---------------- Health ----------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# -------- Main endpoint --------
+# ---------------- Main endpoint ----------------
 @app.post("/api/")
 async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
     start = time.time()
     text = ""
-    csv_files: List[bytes] = []
+    csv_files: List[Tuple[str, bytes]] = []  # (filename, data)
 
     # Robust body parsing
     ctype = request.headers.get("content-type", "")
@@ -233,7 +263,7 @@ async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
                 fname = (val.filename or "").lower()
                 ctyp = (getattr(val, "content_type", "") or "").lower()
                 if fname.endswith(".csv") or "csv" in ctyp:
-                    csv_files.append(content)
+                    csv_files.append((fname, content))
                 else:
                     if not text:
                         text = _decode(content)
@@ -247,17 +277,15 @@ async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
 
     spec = parse_declared_keys_from_text(text)
 
-    # If no input at all
     if not (text or csv_files):
         raise HTTPException(400, "No input received")
 
     # ------------- CSV tasks -------------
     if csv_files:
-        # Use the first CSV (public tests send one)
         try:
-            df = pd.read_csv(io.BytesIO(csv_files[0]))
-        except Exception as e:
-            # Return minimal structure rather than failing
+            csv_bytes = choose_csv(csv_files, text)
+            df = pd.read_csv(io.BytesIO(csv_bytes))
+        except Exception:
             return minimal_valid_response(spec)
 
         cols = {c.lower(): c for c in df.columns}
@@ -271,17 +299,17 @@ async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
             df[precip_col] = pd.to_numeric(df[precip_col], errors="coerce")
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
-            average_temp_c = coerce_number(df[temp_col].mean(skipna=True))
+            average_temp_c = jnum(df[temp_col].mean(skipna=True))
             if df[precip_col].notna().any():
                 max_precip = df[precip_col].max()
                 max_rows = df[df[precip_col] == max_precip].sort_values(date_col)
                 max_precip_date = max_rows.iloc[0][date_col].date().isoformat()
             else:
                 max_precip_date = ""
-            min_temp_c = coerce_number(df[temp_col].min(skipna=True))
-            corr = float(df[temp_col].corr(df[precip_col])) if df[[temp_col,precip_col]].notna().all(axis=1).sum() >= 2 else 0.0
+            min_temp_c = jnum(df[temp_col].min(skipna=True))
+            corr = float(df[temp_col].corr(df[precip_col])) if df[[temp_col, precip_col]].notna().all(axis=1).sum() >= 2 else 0.0
             if np.isnan(corr): corr = 0.0
-            average_precip_mm = coerce_number(df[precip_col].mean(skipna=True))
+            average_precip_mm = jnum(df[precip_col].mean(skipna=True))
             sdf = df.sort_values(date_col)
             temp_line_chart = _weather_temp_line(sdf[date_col], sdf[temp_col])
             precip_histogram = _weather_precip_hist(df[precip_col])
@@ -290,7 +318,7 @@ async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
                 "average_temp_c": average_temp_c,
                 "max_precip_date": max_precip_date,
                 "min_temp_c": min_temp_c,
-                "temp_precip_correlation": float(corr),
+                "temp_precip_correlation": jnum(corr),
                 "average_precip_mm": average_precip_mm,
                 "temp_line_chart": temp_line_chart,
                 "precip_histogram": precip_histogram,
@@ -305,22 +333,22 @@ async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
             df[sales_col] = pd.to_numeric(df[sales_col], errors="coerce")
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
-            total_sales = coerce_number(df[sales_col].sum(skipna=True))
+            total_sales = jnum(df[sales_col].sum(skipna=True))
             region_totals = df.groupby(region_col, dropna=False)[sales_col].sum().sort_values(ascending=False)
             top_region = "" if region_totals.empty else str(region_totals.index[0])
             day = df[date_col].dt.day
             corr = float(day.corr(df[sales_col])) if day.notna().sum() >= 2 else 0.0
             if np.isnan(corr): corr = 0.0
             bar_chart = _bar_chart_region_totals(region_totals)
-            median_sales = coerce_number(df[sales_col].median(skipna=True)) if df[sales_col].notna().any() else 0.0
-            total_sales_tax = coerce_number(total_sales * 0.10)
+            median_sales = jnum(df[sales_col].median(skipna=True)) if df[sales_col].notna().any() else 0.0
+            total_sales_tax = jnum(total_sales * 0.10)
             sdf = df.sort_values(date_col)
             cumulative_sales_chart = _line_chart_cumulative(sdf[date_col], sdf[sales_col].fillna(0).cumsum())
 
             out = {
                 "total_sales": total_sales,
                 "top_region": top_region,
-                "day_sales_correlation": float(corr),
+                "day_sales_correlation": jnum(corr),
                 "bar_chart": bar_chart,
                 "median_sales": median_sales,
                 "total_sales_tax": total_sales_tax,
@@ -345,11 +373,11 @@ async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
             network_graph = _network_graph_image(nodes, undirected_edges)
             degree_histogram = _degree_histogram_image(degrees)
             out = {
-                "edge_count": float(E),
+                "edge_count": jnum(E),
                 "highest_degree_node": highest,
-                "average_degree": average_degree,
-                "density": density,
-                "shortest_path_alice_eve": shortest,
+                "average_degree": jnum(average_degree),
+                "density": jnum(density),
+                "shortest_path_alice_eve": jnum(shortest),
                 "network_graph": network_graph,
                 "degree_histogram": degree_histogram,
             }
@@ -358,20 +386,19 @@ async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
         # GENERIC CSV FALLBACK (unknown schema) → honor declared keys if any
         if time_left(start) < 10:
             return minimal_valid_response(spec)
-        # Try to build something sensible:
+
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         cat_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
         date_cols = [c for c in df.columns if re.search(r"date|time|timestamp|day", c, re.I)]
-        out = {}
-        # Populate by spec if present
+
+        out: Dict[str, Any] = {}
         if spec.get("type") == "object" and spec.get("keys"):
             for key, typ in spec["keys"]:
                 kl = key.lower()
                 if "chart" in kl or "plot" in kl:
-                    # choose a reasonable plot based on columns
                     if "hist" in kl and num_cols:
                         fig, ax = plt.subplots(figsize=(4.2, 3.0))
-                        ax.hist(df[num_cols[0]].dropna().values, bins=10)  # color unspecified
+                        ax.hist(df[num_cols[0]].dropna().values, bins=10)
                         ax.set_title(f"Histogram of {num_cols[0]}")
                         out[key] = _png_data_uri(fig, 100)
                     elif "line" in kl and date_cols and num_cols:
@@ -387,21 +414,19 @@ async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
                 elif typ and any(t in (typ or "") for t in ["number","float","int"]):
                     out[key] = 0.0
                 else:
-                    # heuristics
                     if any(t in kl for t in ["total","sum"]) and num_cols:
-                        out[key] = coerce_number(df[num_cols[0]].sum(skipna=True))
+                        out[key] = jnum(df[num_cols[0]].sum(skipna=True))
                     elif "median" in kl and num_cols:
-                        out[key] = coerce_number(df[num_cols[0]].median(skipna=True))
-                    elif "mean" in kl or "average" in kl and num_cols:
-                        out[key] = coerce_number(df[num_cols[0]].mean(skipna=True))
+                        out[key] = jnum(df[num_cols[0]].median(skipna=True))
+                    elif ("mean" in kl or "average" in kl) and num_cols:
+                        out[key] = jnum(df[num_cols[0]].mean(skipna=True))
                     elif "correlation" in kl and len(num_cols) >= 2:
                         c = df[num_cols[0]].corr(df[num_cols[1]])
-                        out[key] = float(c) if pd.notna(c) else 0.0
+                        out[key] = jnum(c)
                     else:
                         out[key] = ""
             return out or minimal_valid_response(spec)
 
-        # If no spec, return something harmless
         return {"status": "unsupported_csv"}
 
     # ------------- Wikipedia sample -------------
@@ -410,10 +435,9 @@ async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
         if time_left(start) < 10:
             return minimal_valid_response(spec)
         url = lines[0]
-        from httpx import HTTPStatusError
         try:
             df = await fetch_wikipedia_table(url)
-        except HTTPStatusError as e:
+        except Exception:
             return minimal_valid_response(spec)
         df.columns = [re.sub(r"\[.*?\]", "", c) for c in df.columns]
         needed = {"Worldwide gross", "Year", "Rank", "Peak"}
@@ -439,7 +463,7 @@ async def analyze(request: Request, task: Optional[UploadFile] = File(None)):
             slope, intercept = np.polyfit(df_nr["Rank_num"], df_nr["Peak_num"], 1)
             slope, intercept = float(slope), float(intercept)
         uri = make_scatterplot(df_nr, "Rank_num", "Peak_num", slope, intercept)
-        return [count, earliest, corr, uri]
+        return [count, earliest, jnum(corr), uri]
 
     # ------------- Final fallback -------------
     return minimal_valid_response(spec)
